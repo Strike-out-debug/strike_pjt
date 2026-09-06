@@ -23,10 +23,10 @@
 #include <unistd.h>
 #include <atomic>
 #include <cmath>
+#include <chrono>
+#include <iomanip>
 std::atomic<bool> save_request(false);
 
-// BLE受信時に直前1秒分だけ保存
-std::deque<cv::Mat> pre_buffer;
 #define SYSREG_ID                   0x0000
 #define SYSREG_DPHY_SW_RESET        0x0001
 #define SYSREG_CAM_ENABLE           0x0002
@@ -422,8 +422,14 @@ int main(int argc, char *argv[])
 
     jelly::VideoDmaControl vdmaw0(reg_wdma0, 2, 2, true);
     jelly::VideoDmaControl vdmaw1(reg_wdma1, 2, 2, true);
-    std::deque<cv::Mat> frame_buffer;
-    size_t buffer_frames = fps;   // 常に1秒分保持
+    
+    struct FrameData
+    {
+        cv::Mat image;
+        std::chrono::steady_clock::time_point time;
+    };
+
+    std::deque<FrameData> frame_buffer;
 
     cv::namedWindow("img", cv::WINDOW_NORMAL);
     cv::resizeWindow("img", width + 64, height + 128);
@@ -443,15 +449,20 @@ int main(int argc, char *argv[])
     std::thread uart(uart_thread);
     uart.detach();
 
+    int actual_frame_count = 0;
+    auto fps_timer = std::chrono::steady_clock::now();
+    uint32_t prev_frame_counter = reg_sys.ReadReg(SYSREG_FRAME_COUNT);
+
+    // ---- Display FPS limiter ----
+    auto display_timer = std::chrono::steady_clock::now();
+    const double DISPLAY_INTERVAL = 1.0 / 30.0;   // 30fps表示
+
     int key;
-    while ( (key = (cv::waitKey(10) & 0xff)) != 0x1b ) {
+    while ( (key = (cv::waitKey(1) & 0xff)) != 0x1b ) {
         if ( g_signal ) { break; }
         gain     = cv::getTrackbarPos("gain", "img");
         fps      = cv::getTrackbarPos("fps", "img");
         exposure = cv::getTrackbarPos("exposure", "img");
-
-        // リングバッファは現在のFPSと同じ枚数（1秒分）
-        buffer_frames = std::max(1, fps);
 
         cam.SetGainDb((float)gain / 10.0f);
         int period = 100000000 / fps;
@@ -465,83 +476,130 @@ int main(int argc, char *argv[])
         cv::Mat img_raw(height, width, CV_16U);
         udmabuf0_acc.MemCopyTo(img_raw.data, 0, width * height * 2);
 
-        frame_buffer.push_back(img_raw.clone());
-        while(frame_buffer.size() > buffer_frames)
+        auto now = std::chrono::steady_clock::now();
+
+        frame_buffer.push_back({img_raw.clone(), now});
+
+        while (!frame_buffer.empty())
         {
-            frame_buffer.pop_front();
+            auto age =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - frame_buffer.front().time).count();
+
+            if (age > 1000)
+              frame_buffer.pop_front();
+            else
+                break;
         }
 
         if(save_request.exchange(false))
         {
-            // BLE受信時点までの1秒分を保存
-            pre_buffer = frame_buffer;
 
             std::cout << "Saving previous 1 second..." << std::endl;
 
             int count = 0;
-            for(auto &f : pre_buffer)
+            for(auto &f : frame_buffer)
             {
                 char fname[256];
                 sprintf(fname, "rec/pre_%03d.png", count++);
-                save_frame_png(f, fname, color);
+                save_frame_png(f.image, fname, color);
             }
 
-            std::cout << "Saved "
-                      << pre_buffer.size()
+            std::cout << std::dec
+                      << "Saved "
+                      << frame_buffer.size()
                       << " pre-trigger frames." << std::endl;
         }
 
-        cv::Mat img_preview = img_raw * 64;
-        cv::Mat img_view;
-        if ( color ) {
-            cv::Mat img_bgr;
-            cv::cvtColor(img_preview, img_view, cv::COLOR_BayerBG2BGR);
-        }
-        else {
-            img_view = img_preview;
-        }
+        // ---- Display only 30fps ----
+        auto display_now = std::chrono::steady_clock::now();
+        double display_elapsed =
+            std::chrono::duration<double>(display_now - display_timer).count();
 
-        // --------------------------------------------------------
-        // ホームベース前縁の計測結果を画面に表示
-        // --------------------------------------------------------
-        if (base_point_count >= 1)
+        if (display_elapsed >= DISPLAY_INTERVAL)
         {
-            cv::circle(img_view, base_point1, 5, cv::Scalar(0, 255, 0), -1);
-        }
+            display_timer = display_now;
 
-        if (base_point_count >= 2)
-        {
-            cv::circle(img_view, base_point2, 5, cv::Scalar(0, 255, 0), -1);
-            cv::line(img_view, base_point1, base_point2,
-                     cv::Scalar(0, 255, 0), 2);
+            cv::Mat img_preview = img_raw * 64;
+            cv::Mat img_view;
 
-            char text[128];
-            sprintf(text, "Base edge: %.1f px", base_edge_pixels);
-            cv::putText(img_view, text, cv::Point(10, 25),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.65,
-                        cv::Scalar(0, 255, 0), 2);
+            if (color)
+            {
+                cv::cvtColor(img_preview, img_view, cv::COLOR_BayerBG2BGR);
+            }
+            else
+            {
+                img_view = img_preview;
+            }
 
-            sprintf(text, "Target ball: %.1f px", target_ball_pixels);
-            cv::putText(img_view, text, cv::Point(10, 50),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.65,
-                        cv::Scalar(0, 255, 0), 2);
-        }
-        else
-        {
+            // --------------------------------------------------------
+            // ホームベース表示（元のコードをそのまま）
+            // --------------------------------------------------------
+            if (base_point_count >= 1)
+            {
+                cv::circle(img_view, base_point1, 5, cv::Scalar(0,255,0), -1);
+            }
+
+            if (base_point_count >= 2)
+            {
+                cv::circle(img_view, base_point2, 5, cv::Scalar(0,255,0), -1);
+                cv::line(img_view, base_point1, base_point2,
+                         cv::Scalar(0,255,0), 2);
+
+                char text[128];
+
+                sprintf(text, "Base edge: %.1f px", base_edge_pixels);
+                cv::putText(img_view, text, cv::Point(10,25),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65,
+                    cv::Scalar(0,255,0), 2);
+
+                sprintf(text, "Target ball: %.1f px", target_ball_pixels);
+                cv::putText(img_view, text, cv::Point(10,50),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.65,
+                    cv::Scalar(0,255,0), 2);
+            }
+             else
+            {
+                cv::putText(img_view,
+                    "Click home-plate front edge: 2 points",
+                    cv::Point(10,25),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(0,255,0), 2);
+            }
+
             cv::putText(img_view,
-                        "Click home-plate front edge: 2 points",
-                        cv::Point(10, 25),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                        cv::Scalar(0, 255, 0), 2);
+                "Right click: reset",
+                cv::Point(10,height-10),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                cv::Scalar(0,255,0), 1);
+
+            cv::imshow("img", img_view);
         }
 
-        cv::putText(img_view,
-                    "Right click: reset",
-                    cv::Point(10, height - 10),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                    cv::Scalar(0, 255, 0), 1);
+        // ---- Actual FPS / Camera FPS ----
+        actual_frame_count++;
 
-        cv::imshow("img", img_view);
+        auto fps_now = std::chrono::steady_clock::now();
+        double elapsed =
+            std::chrono::duration<double>(fps_now - fps_timer).count();
+
+        if (elapsed >= 1.0)
+        {
+            double actual_fps = actual_frame_count / elapsed;
+            uint32_t frame_counter = reg_sys.ReadReg(SYSREG_FRAME_COUNT);
+            uint32_t camera_fps = frame_counter - prev_frame_counter;
+            prev_frame_counter = frame_counter;
+
+            std::cout << std::dec
+                << "[FPS] Camera=" << camera_fps
+                << "  Actual=" << std::fixed << std::setprecision(1)
+                << actual_fps
+                << "  Buffer=" << frame_buffer.size()
+                << std::endl;
+
+            actual_frame_count = 0;
+            fps_timer = fps_now;
+        }
     }
 
     std::cout << "close device" << std::endl;
