@@ -128,6 +128,141 @@ void on_mouse(int event, int x, int y, int flags, void* userdata)
         std::cout << "Home plate measurement reset." << std::endl;
     }
 }
+// ============================
+// Step4a Ball detector
+// ============================
+
+struct BallInfo
+{
+    bool found = false;
+    float diameter = 0.0f;
+    cv::Point2f center;
+};
+
+static BallInfo detect_ball(const cv::Mat &img_gray,
+                            const cv::Rect &roi,
+                            double target_diameter)
+{
+    BallInfo ball;
+
+    if (roi.width <= 0 || roi.height <= 0)
+        return ball;
+
+    // ------------------------------------------------
+    // ROI切り出し
+    // ------------------------------------------------
+    cv::Mat roi_img = img_gray(roi).clone();
+
+    // 10bit → 8bit
+    cv::Mat roi8;
+    roi_img.convertTo(roi8, CV_8UC1, 255.0 / 1023.0);
+
+    // ノイズ低減
+    cv::GaussianBlur(roi8, roi8, cv::Size(5,5), 0);
+
+    // ------------------------------------------------
+    // 白い領域を抽出
+    // Step4a の120より少し高めからスタート
+    // ------------------------------------------------
+    cv::Mat bin;
+    cv::threshold(roi8, bin, 140, 255, cv::THRESH_BINARY);
+
+    // ------------------------------------------------
+    // 白球内部の分断された領域をつなぐ
+    // ------------------------------------------------
+    cv::Mat kernel =
+        cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                  cv::Size(7,7));
+
+    cv::morphologyEx(bin, bin,
+                     cv::MORPH_CLOSE,
+                     kernel);
+
+    // ------------------------------------------------
+    // 輪郭検出
+    // ------------------------------------------------
+    std::vector<std::vector<cv::Point>> contours;
+
+    cv::findContours(bin, contours,
+                     cv::RETR_EXTERNAL,
+                     cv::CHAIN_APPROX_SIMPLE);
+
+    // ------------------------------------------------
+    // ボール径の許容範囲
+    //
+    // 検出開始用なので広め：
+    // Target の30% ～ 130%
+    // ------------------------------------------------
+    double min_diameter = target_diameter * 0.30;
+    double max_diameter = target_diameter * 1.30;
+
+    double best_score = 1.0e30;
+
+    for (auto &c : contours)
+    {
+        double area = cv::contourArea(c);
+
+        if (area < 20)
+            continue;
+
+        // --------------------------------------------
+        // 円形度
+        // --------------------------------------------
+        double peri = cv::arcLength(c, true);
+
+        if (peri <= 0)
+            continue;
+
+        double circularity =
+            4.0 * CV_PI * area / (peri * peri);
+
+        // 少し緩めにする
+        if (circularity < 0.50)
+            continue;
+
+        // --------------------------------------------
+        // 最小外接円
+        // --------------------------------------------
+        cv::Point2f center;
+        float radius;
+
+        cv::minEnclosingCircle(c, center, radius);
+
+        double diameter = radius * 2.0;
+
+        // --------------------------------------------
+        // Target Ballから大きく外れるものを除外
+        // --------------------------------------------
+        if (diameter < min_diameter ||
+            diameter > max_diameter)
+        {
+            continue;
+        }
+
+        // ROI座標 → 画像全体の座標
+        center.x += roi.x;
+        center.y += roi.y;
+
+        // --------------------------------------------
+        // Target Ballに近いものを優先
+        // --------------------------------------------
+        double score =
+            std::abs(diameter - target_diameter);
+
+        if (score < best_score)
+        {
+            best_score = score;
+
+            ball.found = true;
+            ball.diameter =
+                static_cast<float>(diameter);
+
+            ball.center = center;
+        }
+    }
+
+    return ball;
+}
 
 void uart_thread()
 {
@@ -476,6 +611,39 @@ int main(int argc, char *argv[])
         cv::Mat img_raw(height, width, CV_16U);
         udmabuf0_acc.MemCopyTo(img_raw.data, 0, width * height * 2);
 
+        BallInfo ball;
+        cv::Rect roi;
+        bool roi_valid = false;
+
+        if (base_point_count == 2 )
+        {
+            int margin_x = 50;
+            int margin_y = 50;
+            int roi_height = 180;
+
+            int left_x = std::min(base_point1.x, base_point2.x);
+            int top_y  = std::min(base_point1.y, base_point2.y);
+
+            roi = cv::Rect(
+                    left_x - margin_x,
+                    top_y - roi_height - margin_y,
+                    std::abs(base_point2.x - base_point1.x) + margin_x * 2,
+                                roi_height
+            );
+
+            roi &= cv::Rect(0, 0, width, height);
+            roi_valid = true;
+
+            /*std::cout << "ROI = "
+                << roi.x << ","
+                << roi.y << " "
+                << roi.width << "x"
+                << roi.height << std::endl;
+            */
+            ball = detect_ball(img_raw, roi, target_ball_pixels);
+            
+        }
+
         auto now = std::chrono::steady_clock::now();
 
         frame_buffer.push_back({img_raw.clone(), now});
@@ -520,16 +688,18 @@ int main(int argc, char *argv[])
         {
             display_timer = display_now;
 
-            cv::Mat img_preview = img_raw * 64;
             cv::Mat img_view;
 
             if (color)
             {
-                cv::cvtColor(img_preview, img_view, cv::COLOR_BayerBG2BGR);
-            }
+                cv::Mat img8;
+                img_raw.convertTo(img8, CV_8UC1, 255.0/1023.0);
+
+                cv::cvtColor(img8, img_view, cv::COLOR_BayerBG2BGR);
+            }           
             else
             {
-                img_view = img_preview;
+                img_raw.convertTo(img_view, CV_8UC1, 255.0/1023.0);
             }
 
             // --------------------------------------------------------
@@ -544,7 +714,7 @@ int main(int argc, char *argv[])
             {
                 cv::circle(img_view, base_point2, 5, cv::Scalar(0,255,0), -1);
                 cv::line(img_view, base_point1, base_point2,
-                         cv::Scalar(0,255,0), 2);
+                         cv::Scalar(0,255,0), 3);
 
                 char text[128];
 
@@ -573,6 +743,32 @@ int main(int argc, char *argv[])
                 cv::FONT_HERSHEY_SIMPLEX, 0.5,
                 cv::Scalar(0,255,0), 1);
 
+            // Step4a ROI表示
+            if (roi_valid)
+            {
+                cv::rectangle(img_view,
+                  roi,
+                  cv::Scalar(0,255,255),
+                  2);
+            }
+            
+            if (ball.found)
+            {
+                cv::circle(img_view,
+                            ball.center,
+                            (int)(ball.diameter * 0.5),
+                            cv::Scalar(0,255,255),
+                            3);
+
+                cv::putText(img_view,
+                            cv::format("Ball %.1f px", ball.diameter),
+                            ball.center + cv::Point2f(8,-8),
+                            cv::FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            cv::Scalar(255,255,0),
+                            2);
+            }
+            
             cv::imshow("img", img_view);
         }
 
@@ -590,13 +786,13 @@ int main(int argc, char *argv[])
             uint32_t camera_fps = frame_counter - prev_frame_counter;
             prev_frame_counter = frame_counter;
 
-            std::cout << std::dec
+            /*std::cout << std::dec
                 << "[FPS] Camera=" << camera_fps
                 << "  Actual=" << std::fixed << std::setprecision(1)
                 << actual_fps
                 << "  Buffer=" << frame_buffer.size()
                 << std::endl;
-
+            */
             actual_frame_count = 0;
             fps_timer = fps_now;
         }
