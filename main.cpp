@@ -1,3 +1,13 @@
+// ============================================================
+// Step 4a.2-5
+// Frame difference based motion detection
+// - Frame difference
+// - Binary threshold
+// - ROI restriction
+// - Contour detection
+// - Group nearby contours
+// ============================================================
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -592,6 +602,11 @@ int main(int argc, char *argv[])
     auto display_timer = std::chrono::steady_clock::now();
     const double DISPLAY_INTERVAL = 1.0 / 30.0;   // 30fps表示
 
+    // ---- Step4a.2 frame difference ----
+    cv::Mat prev_frame;
+    cv::Mat diff_image;
+    cv::Mat diff_binary;
+
     int key;
     while ( (key = (cv::waitKey(1) & 0xff)) != 0x1b ) {
         if ( g_signal ) { break; }
@@ -610,6 +625,27 @@ int main(int argc, char *argv[])
         vdmaw0.Oneshot(dmabuf0_phys_adr, width, height, 1);
         cv::Mat img_raw(height, width, CV_16U);
         udmabuf0_acc.MemCopyTo(img_raw.data, 0, width * height * 2);
+
+        // ---- Step4a.2 frame difference ----
+        if (!prev_frame.empty())
+        {
+            // 前フレームとの差分
+            cv::absdiff(img_raw, prev_frame, diff_image);
+
+            // 10bit画像(0～1023) → 8bit画像(0～255)
+            cv::Mat diff8;
+            diff_image.convertTo(diff8, CV_8UC1, 255.0 / 1023.0);
+
+            // 差分を二値化
+            // まずは20から試す->40へ
+            cv::threshold(diff8,
+                  diff_binary,
+                  40,
+                  255,
+                  cv::THRESH_BINARY);
+        }
+
+        img_raw.copyTo(prev_frame);
 
         BallInfo ball;
         cv::Rect roi;
@@ -642,6 +678,86 @@ int main(int argc, char *argv[])
             */
             ball = detect_ball(img_raw, roi, target_ball_pixels);
             
+        }
+
+        // ---- Step4a.2-4 contour detection in ROI ----
+        std::vector<cv::Rect> motion_rects;
+        std::vector<cv::Rect> grouped_rects;
+
+        if (roi_valid && !diff_binary.empty())
+        {
+            // 差分二値画像からROIだけを切り出す
+            cv::Mat diff_roi = diff_binary(roi).clone();
+
+            // 途切れた差分を少しつなぐ
+            cv::Mat kernel =
+                cv::getStructuringElement(
+                cv::MORPH_ELLIPSE,
+                cv::Size(5, 5));
+
+            cv::morphologyEx(diff_roi,
+                diff_roi,
+                cv::MORPH_CLOSE,
+                kernel);
+
+            // ROI内の輪郭を検出
+            std::vector<std::vector<cv::Point>> contours;
+
+            cv::findContours(diff_roi,
+                contours,
+                cv::RETR_EXTERNAL,
+                cv::CHAIN_APPROX_SIMPLE);
+
+            for (const auto &c : contours)
+            {
+                cv::Rect r = cv::boundingRect(c);
+
+                // 極端に小さいノイズだけ除外
+                if (r.width < 2 || r.height < 2)
+                continue;
+
+                // rはROI内座標なので、画像全体の座標へ変換
+                r.x += roi.x;
+                r.y += roi.y;
+
+                motion_rects.push_back(r);
+            }
+            // ------------------------------------------------
+            // Step4a.2-5
+            // 近接するContourをグループ化
+            // ------------------------------------------------
+
+            // Target Ball径を基準に結合距離を決める
+            int merge_distance =
+            std::max(10, (int)(target_ball_pixels * 0.30));
+
+            for (const auto &r : motion_rects)
+            {
+                bool merged = false;
+
+                for (auto &g : grouped_rects)
+                {
+                    // 両矩形をmerge_distanceだけ拡張
+                    cv::Rect expanded_g(
+                    g.x - merge_distance,
+                    g.y - merge_distance,
+                    g.width  + merge_distance * 2,
+                    g.height + merge_distance * 2);
+
+                    // rと近接していれば同じグループとする
+                    if ((expanded_g & r).area() > 0)
+                    {
+                        g = g | r;
+                        merged = true;
+                        break;
+                    }
+                }
+
+                if (!merged)
+                {
+                    grouped_rects.push_back(r);
+                }           
+            }
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -769,7 +885,49 @@ int main(int argc, char *argv[])
                             2);
             }
             
+            // ---- Step4a.2-3 motion contour display ----
+            for (const auto &r : grouped_rects)
+            {
+                // 検出した動体を紫色の四角で表示
+                cv::rectangle(img_view,
+                              r,
+                              cv::Scalar(255, 0, 255),
+                              2);
+
+                // 幅 x 高さを表示
+                std::string size_text =
+                    std::to_string(r.width) +
+                    "x" +
+                    std::to_string(r.height);
+
+                cv::putText(img_view,
+                            size_text,
+                            cv::Point(r.x,
+                                      std::max(15, r.y - 5)),
+                            cv::FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            cv::Scalar(255, 0, 255),
+                            1);
+            }
+
             cv::imshow("img", img_view);
+
+            if (!diff_image.empty())
+            {
+                cv::Mat diff_view;
+
+                diff_image.convertTo(
+                    diff_view,
+                    CV_8UC1,
+                255.0 / 1023.0);
+
+            cv::imshow("diff", diff_view);
+            }
+
+            if (!diff_binary.empty())
+            {
+                cv::imshow("diff binary", diff_binary);
+            }
         }
 
         // ---- Actual FPS / Camera FPS ----
