@@ -46,6 +46,22 @@ void signal_handler(int signo) {
     g_signal = true;
 }
 
+// Capture one frame from the camera DMA buffer.
+// Returns a 16-bit image scaled from the 10-bit sensor data.
+cv::Mat captureFrame(
+    jelly::VideoDmaControl& vdma,
+    jelly::UdmabufAccessor& dmabuf,
+    decltype(dmabuf.GetPhysAddr()) phys_addr,
+    int width,
+    int height)
+{
+    vdma.Oneshot(phys_addr, width, height, 1);
+
+    cv::Mat img(height, width, CV_16U);
+    dmabuf.MemCopyTo(img.data, 0, width * height * 2);
+
+    return img * 64;
+}
 
 // メイン関数
 int main(int argc, char *argv[])
@@ -288,11 +304,9 @@ int main(int argc, char *argv[])
         reg_timgen.WriteReg(TIMGENREG_PARAM_TRIG0_END,   trig_end);
         reg_timgen.WriteReg(TIMGENREG_CTL_CONTROL, 3);
 
-        // 画像読み込み
-        vdmaw0.Oneshot(dmabuf0_phys_adr, width, height, 1);
-        cv::Mat img(height, width, CV_16U);
-        udmabuf0_acc.MemCopyTo(img.data, 0, width * height * 2);
-        img = img * 64; // 10bit -> 16bit
+        // 画像取得処理を独立した関数にする
+        cv::Mat img = captureFrame(
+            vdmaw0, udmabuf0_acc, dmabuf0_phys_adr, width, height);
 
         // 表示画像準備
         cv::Mat img_view;
