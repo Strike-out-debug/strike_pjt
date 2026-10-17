@@ -1,11 +1,13 @@
 // ============================================================
-// Step 4a.2-5
+// Step 4a.2-7
 // Frame difference based motion detection
 // - Frame difference
 // - Binary threshold
 // - ROI restriction
 // - Contour detection
 // - Group nearby contours
+// - Display center point of each motion group
+// - Keep motion center history
 // ============================================================
 
 #include <stdio.h>
@@ -606,6 +608,11 @@ int main(int argc, char *argv[])
     cv::Mat prev_frame;
     cv::Mat diff_image;
     cv::Mat diff_binary;
+    // ---- Step4a.2-7 motion center history ----
+    // 1フレーム分の中心点群を、過去5フレーム保持する
+    std::deque<std::vector<cv::Point2f>> motion_center_history;
+
+    const int MOTION_HISTORY_FRAMES = 5;
 
     int key;
     while ( (key = (cv::waitKey(1) & 0xff)) != 0x1b ) {
@@ -759,6 +766,30 @@ int main(int argc, char *argv[])
                 }           
             }
         }
+        // ------------------------------------------------
+        // Step4a.2-7
+        // 現在フレームの動体中心座標を保存
+        // ------------------------------------------------
+        std::vector<cv::Point2f> current_centers;
+
+        for (const auto &r : grouped_rects)
+        {
+            cv::Point2f center(
+            r.x + r.width  / 2.0f,
+            r.y + r.height / 2.0f
+            );
+
+            current_centers.push_back(center);
+        }
+
+        // 現在フレームの中心点群を履歴へ追加
+        motion_center_history.push_back(current_centers);
+
+        // 過去5フレームだけ残す
+        while (motion_center_history.size() > MOTION_HISTORY_FRAMES)
+        {
+            motion_center_history.pop_front();
+        }
 
         auto now = std::chrono::steady_clock::now();
 
@@ -885,29 +916,60 @@ int main(int argc, char *argv[])
                             2);
             }
             
-            // ---- Step4a.2-3 motion contour display ----
+            // ---- Step4a.2-6 motion contour + center display ----
             for (const auto &r : grouped_rects)
             {
                 // 検出した動体を紫色の四角で表示
-                cv::rectangle(img_view,
-                              r,
-                              cv::Scalar(255, 0, 255),
-                              2);
+                    cv::rectangle(img_view,
+                    r,
+                    cv::Scalar(255, 0, 255),
+                    2);
 
                 // 幅 x 高さを表示
-                std::string size_text =
+                    std::string size_text =
                     std::to_string(r.width) +
                     "x" +
                     std::to_string(r.height);
 
                 cv::putText(img_view,
-                            size_text,
-                            cv::Point(r.x,
-                                      std::max(15, r.y - 5)),
-                            cv::FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            cv::Scalar(255, 0, 255),
-                            1);
+                    size_text,
+                    cv::Point(r.x,
+                          std::max(15, r.y - 5)),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    cv::Scalar(255, 0, 255),
+                    1);
+
+                // ------------------------------------------------
+                // Step4a.2-6
+                // grouped contour の中心座標を求める
+                // ------------------------------------------------
+                cv::Point2f center(
+                    r.x + r.width  / 2.0f,
+                    r.y + r.height / 2.0f
+                );
+
+                // 中心を赤点で表示
+                    cv::circle(img_view,
+                    center,
+                    4,
+                    cv::Scalar(0, 0, 255),
+                    -1);
+            }
+            // ------------------------------------------------
+            // Step4a.2-7
+            // 過去フレームの中心点を表示
+            // ------------------------------------------------
+            for (const auto &frame_centers : motion_center_history)
+            {
+                for (const auto &p : frame_centers)
+                {
+                    cv::circle(img_view,
+                        p,
+                        2,
+                        cv::Scalar(0, 0, 255),
+                        -1);
+                }
             }
 
             cv::imshow("img", img_view);
