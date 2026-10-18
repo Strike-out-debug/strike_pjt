@@ -1,0 +1,8 @@
+# VSCode local settings
+/.vscode/
+
+# Windows Replay
+/replay/build/
+/replay/vcpkg_installed/
+/replay/data/
+/replay/out/

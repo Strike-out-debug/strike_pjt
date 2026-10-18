@@ -1,0 +1,13 @@
+{
+  "name": "strike-replay",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "opencv4",
+      "features": [
+        "ffmpeg"
+      ]
+    }
+  ],
+  "builtin-baseline": "bf19794383e8fb95eba5aa553235bc8ec2271688"
+}
