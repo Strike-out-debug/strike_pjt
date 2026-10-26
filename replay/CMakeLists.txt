@@ -10,6 +10,7 @@ find_package(OpenCV CONFIG REQUIRED)
 
 add_executable(strike_replay
     main.cpp
+    FrameReader.cpp
 )
 
 target_link_libraries(strike_replay
