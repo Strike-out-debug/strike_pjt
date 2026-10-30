@@ -1,3 +1,6 @@
+#include <fstream>
+#include <iomanip>
+#include "BallDetector.h"
 #include <iostream>
 #include <string>
 #include <algorithm>
@@ -6,7 +9,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
-
+#include <opencv2/imgcodecs.hpp>
 #include "FrameReader.h"
 
 cv::Mat makeDisplayImage(const cv::Mat& raw)
@@ -35,6 +38,50 @@ cv::Mat makeDisplayImage(const cv::Mat& raw)
     }
 
     return cv::Mat();
+}
+
+struct PlateEdge
+{
+    cv::Point2f points[2];
+    int count = 0;
+};
+
+void onMouse(int event, int x, int y, int flags, void* userdata)
+{
+    if (event != cv::EVENT_RBUTTONDOWN) {
+        return;
+    }
+
+    auto* edge = static_cast<PlateEdge*>(userdata);
+
+    if (edge == nullptr) {
+        return;
+    }
+
+    if (edge->count >= 2) {
+        edge->count = 0;
+    }
+
+    edge->points[edge->count] =
+        cv::Point2f(static_cast<float>(x),
+                    static_cast<float>(y));
+
+    edge->count++;
+
+    if (edge->count == 2) {
+        double length = cv::norm(
+            edge->points[1] - edge->points[0]
+        );
+
+        double targetDiameter =
+            length * 73.0 / 431.8;
+
+        std::cout << "Plate edge: "
+                  << length << " px\n";
+
+        std::cout << "Target ball diameter: "
+                  << targetDiameter << " px\n";
+    }
 }
 
 int main(int argc, char* argv[])
@@ -67,6 +114,76 @@ int main(int argc, char* argv[])
 
     const int totalFrames = reader.totalFrames();
     const double playbackFps = reader.playbackFps();
+    
+    // Analyze all frames and export detection results to CSV.
+    std::filesystem::create_directories("out");
+
+    std::ofstream csv("out/ball_detection.csv");
+
+    if (!csv) {
+        std::cerr << "Failed to create CSV file\n";
+        return 1;
+    }
+
+    csv << "frame,time_ms,detected,center_x,center_y,"
+        "diameter_px,processing_us\n";
+
+    csv << std::fixed << std::setprecision(3);
+
+    BallDetector csvDetector;
+
+    for (int i = 0; i < totalFrames; ++i) {
+        cv::Mat rawFrame;
+
+        if (!reader.readFrame(i, rawFrame)) {
+            std::cerr << "Failed to analyze frame: " << i << "\n";
+            break;
+       }
+
+        BallDetection result = csvDetector.detect(rawFrame);
+
+        // Save debug images for frames 1030-1034.
+        if (i >= 1030 && i <= 1034) {
+            std::filesystem::create_directories("out/debug");
+
+            // Original frame
+            cv::imwrite(
+            "out/debug/frame_" + std::to_string(i) + ".png",
+            rawFrame
+            );
+
+            // Binary difference image
+            cv::Mat binary = csvDetector.debugBinary();
+
+            if (!binary.empty()) {
+                cv::imwrite(
+                    "out/debug/diff_" + std::to_string(i) + ".png",
+                    binary
+                );
+            }
+        }
+
+        double timeMs = i * 1000.0 / reader.captureFps();
+
+        csv << i << ","
+            << timeMs << ","
+            << (result.detected ? 1 : 0) << ",";
+
+        if (result.detected) {
+            csv << result.center.x << ","
+            << result.center.y << ","
+            << result.diameter;
+        } else {
+            csv << ",,";
+        }
+
+        csv << "," << result.processingUs << "\n";
+    }
+
+    csv.close();
+    csvDetector.reset();
+
+    std::cout << "CSV saved: out/ball_detection.csv\n";
 
     std::cout << "STRIKE Replay\n";
     std::cout << "SPACE: Play/Pause\n";
@@ -76,9 +193,13 @@ int main(int argc, char* argv[])
     std::cout << "ESC: Exit\n";
 
     cv::namedWindow("STRIKE Replay", cv::WINDOW_AUTOSIZE);
+    PlateEdge plateEdge;
+    cv::setMouseCallback("STRIKE Replay", onMouse, &plateEdge);
 
     bool paused = true;
     int frameIndex = 0;
+    BallDetector detector;
+    int previousFrameIndex = -1;
 
     while (true) {
         cv::Mat frame;
@@ -89,12 +210,72 @@ int main(int argc, char* argv[])
             break;
         }
 
+        
+        // Reset differential detection after a jump or backward seek.
+        if (frameIndex != previousFrameIndex + 1) {
+            detector.reset();
+        }
+
+        // Detect using the original image.
+        BallDetection ball = detector.detect(frame);
+        previousFrameIndex = frameIndex;
+
         cv::Mat displayFrame = makeDisplayImage(frame);
 
         if (displayFrame.empty()) {
             std::cerr << "Unsupported image format\n";
             break;
         }
+
+        // Draw detected ball candidate.
+        if (ball.detected) {
+            cv::circle(
+            displayFrame,
+            ball.center,
+            static_cast<int>(ball.diameter / 2.0f),
+            cv::Scalar(0, 0, 255),
+            2
+            );
+
+            cv::circle(
+                displayFrame,
+                ball.center,
+                3,
+                cv::Scalar(0, 255, 255),
+                -1
+            );
+        }   
+
+        // Display detection result and processing time.
+        std::string ballInfo;
+
+        if (ball.detected) {
+            ballInfo =
+            "Ball: (" +
+            std::to_string(static_cast<int>(ball.center.x)) + "," +
+            std::to_string(static_cast<int>(ball.center.y)) + ")" +
+            " D=" + std::to_string(static_cast<int>(ball.diameter)) + "px";
+        }
+        else {
+            ballInfo = "Ball: NOT DETECTED";
+        }
+
+        ballInfo += "  " +
+            std::to_string(static_cast<int>(ball.processingUs)) + "us";
+
+        // Black outline
+        cv::putText(
+            displayFrame, ballInfo, cv::Point(10, 45),
+            cv::FONT_HERSHEY_SIMPLEX, 0.40,
+            cv::Scalar(0, 0, 0), 3
+        );
+
+        // White text
+        cv::putText(
+            displayFrame, ballInfo, cv::Point(10, 45),
+            cv::FONT_HERSHEY_SIMPLEX, 0.40,
+            cv::Scalar(255, 255, 255), 1
+        );
 
         double timeMs =
             frameIndex * 1000.0 / reader.captureFps();
